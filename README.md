@@ -1,15 +1,21 @@
+<div align="center">
+
+# Anki MCP Server
+
+### Anki デッキ自動生成 MCP サーバー
+
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![MCP](https://img.shields.io/badge/MCP-Model_Context_Protocol-8B5CF6?style=for-the-badge)](https://modelcontextprotocol.io/)
 [![Anki](https://img.shields.io/badge/Anki-.apkg_Generator-236ad5?style=for-the-badge)](https://apps.ankiweb.net/)
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 
-# Anki MCP Server
-
 **任意のデータから高品質な Anki デッキ (.apkg) を自動生成する MCP サーバー**
 
-どんな教科・分野のデータでも、Claude に渡すだけで Anki デッキに変換できます。英語学習向けの TTS 音声付きカードにも対応。
-
 ---
+
+</div>
+
+どんな教科・分野のデータでも、Claude に渡すだけで Anki デッキに変換できます。英語学習向けの TTS 音声付きカードにも対応。
 
 ## 特徴
 
