@@ -1,9 +1,7 @@
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python">
-  <img src="https://img.shields.io/badge/MCP-Model_Context_Protocol-8B5CF6?style=for-the-badge" alt="MCP">
-  <img src="https://img.shields.io/badge/Anki-.apkg_Generator-236ad5?style=for-the-badge" alt="Anki">
-  <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License">
-</p>
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![MCP](https://img.shields.io/badge/MCP-Model_Context_Protocol-8B5CF6?style=for-the-badge)](https://modelcontextprotocol.io/)
+[![Anki](https://img.shields.io/badge/Anki-.apkg_Generator-236ad5?style=for-the-badge)](https://apps.ankiweb.net/)
+[![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 
 # Anki MCP Server
 
