@@ -114,6 +114,28 @@ def _strip_html(text: str) -> str:
     return re.sub(r'<[^>]+>', '', text).strip()
 
 
+def _normalize_tags(raw: object) -> list[str]:
+    """
+    tags フィールドを list[str] に正規化する。
+    - list 以外（str、None 等）は単一要素リストか空リストに変換
+    - 各要素は str に強制キャスト
+    - genanki は tags にスペースを含む文字列を許可しないため空白はアンダースコアに置換
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        # 文字列がそのまま渡されたら1タグとして扱う（char分解を防ぐ）
+        raw = [raw]
+    if not isinstance(raw, list):
+        # tuple, set 等もリスト化
+        try:
+            raw = list(raw)
+        except TypeError:
+            return []
+    # B4: str(t).strip() の真偽で空白のみを除外し、空白除去後の値を使う
+    return [s.replace(" ", "_") for t in raw if t is not None for s in [str(t).strip()] if s]
+
+
 def _sanitize_word(word: str) -> str:
     """
     S4: TTS 用 word フィールドから HTML タグと Anki テンプレート metachar ({, }) を除く。
@@ -168,11 +190,17 @@ def _validate_output_path(output_path: str, deck_name: str) -> Path:
     return resolved
 
 
+def _strip_cloze(text: str) -> str:
+    """C2: cloze 構文 {{c1::content}} / {{c1::content::hint}} を content 部分に置換
+    [^:}] でパイプ区切りヒント ("content|hint") も content として保持する"""
+    return re.sub(r'\{\{c\d+::([^:}]+)(?:::[^}]*)?\}\}', r'\1', text)
+
+
 # ── モデル定義 ──────────────────────────────────────────
 
 def _model_id(name: str) -> int:
-    """モデル名から決定論的IDを生成"""
-    return int(hashlib.md5(name.encode()).hexdigest()[:8], 16)
+    """モデル名から決定論的IDを生成 (48-bit)"""
+    return int(hashlib.md5(name.encode()).hexdigest()[:12], 16)
 
 
 # Basic (表→裏)
@@ -375,16 +403,18 @@ TTS_MODELS = {
 
 
 def _deck_id(name: str) -> int:
-    """デッキ名から決定論的IDを生成"""
-    return int(hashlib.md5(f"deck_{name}".encode()).hexdigest()[:8], 16)
+    """デッキ名から決定論的IDを生成 (48-bit)"""
+    return int(hashlib.md5(f"deck_{name}".encode()).hexdigest()[:12], 16)
 
 
 class NoteWithGuid(genanki.Note):
-    """フロントフィールドのみでGUIDを決定するNote（重複インポート防止）"""
+    """モデル名+全フィールドでGUIDを決定するNote（重複インポート防止）"""
 
     @property
     def guid(self):
-        return genanki.guid_for(self.fields[0])
+        # C1: モデル名+全フィールドでGUIDを決定 — cloze非TTS/cloze+TTS間の衝突を防ぐ
+        key = ":".join([self.model.name] + list(self.fields))
+        return genanki.guid_for(key)
 
 
 # ── MCP ツール ──────────────────────────────────────────
@@ -432,12 +462,22 @@ def generate_anki_deck(
     Returns:
         生成されたファイルのパスと統計情報
     """
+    # B4: 空チェックを上限チェックより先に行う
     if not cards:
         return "エラー: カードが空です"
 
+    # S8: カード数上限チェック
+    if len(cards) > _ANKI_CARD_LIMIT:
+        return f"エラー: カード数 {len(cards)} が上限 {_ANKI_CARD_LIMIT} を超えています"
+
+    # B3: deck_name は空白除去した値を以降全て使う（_deck_id, パス生成に影響）
+    deck_name = deck_name.strip() if isinstance(deck_name, str) else ""
+    if not deck_name:
+        return "エラー: deck_name を指定してください"
+
     deck = genanki.Deck(_deck_id(deck_name), deck_name, description=description)
 
-    stats = {"basic": 0, "reversed": 0, "cloze": 0, "typing": 0, "listening": 0, "errors": []}
+    stats: dict = {"basic": 0, "reversed": 0, "cloze": 0, "typing": 0, "listening": 0, "errors": []}
 
     def _field_too_long(label: str, value: str, idx: int) -> bool:
         """S5: 1 フィールドが上限を超えたらエラーとして記録し True を返す"""
@@ -448,14 +488,23 @@ def generate_anki_deck(
             return True
         return False
 
-    # S8: カード数上限チェック
-    if len(cards) > _ANKI_CARD_LIMIT:
-        return f"エラー: カード数 {len(cards)} が上限 {_ANKI_CARD_LIMIT} を超えています"
-
     for i, card in enumerate(cards):
+        # B4: dict 型チェック
+        if not isinstance(card, dict):
+            stats["errors"].append(f"Card {i}: dict ではありません (type={type(card).__name__})")
+            continue
         try:
-            card_type = card.get("type", "basic")
-            tags = card.get("tags", [])
+            # C4: card_type を正規化（str化・前後空白除去・小文字化）
+            card_type = str(card.get("type", "basic")).strip().lower()
+            tags = _normalize_tags(card.get("tags"))
+
+            # U2: known_types は MODELS + TTS_MODELS のキー和集合
+            known_types = set(MODELS.keys()) | set(TTS_MODELS.keys())
+            if card_type not in known_types:
+                stats["errors"].append(
+                    f"Card {i}: 未知の card_type '{card_type}' (有効: {sorted(known_types)})"
+                )
+                continue
 
             if card_type == "cloze":
                 text = _sanitize_html(card.get("text", ""))
@@ -469,8 +518,16 @@ def generate_anki_deck(
                     # S4: word は plain text 化 + Anki metachar 除去
                     raw_word = card.get("word", "")
                     word = _sanitize_word(str(raw_word))
+                    # B5: cloze + tts で word が空なら text から自動導出（{{c\d+::content}} → content）
                     if not word:
-                        word = _sanitize_word(re.sub(r'\{\{c\d+::(.*?)\}\}', r'\1', str(card.get("text", ""))))
+                        derived = _sanitize_word(_strip_cloze(str(card.get("text", ""))))
+                        if derived:
+                            word = derived
+                        else:
+                            stats["errors"].append(
+                                f"Card {i}: cloze + tts だが word を導出できませんでした"
+                            )
+                            continue  # C3: word が空のままノートを作らない
                     if _field_too_long("word", word, i):
                         continue
                     note = NoteWithGuid(
@@ -491,8 +548,12 @@ def generate_anki_deck(
                 front = _sanitize_html(card.get("front", ""))
                 back = _sanitize_html(card.get("back", ""))
                 word = _sanitize_word(str(card.get("word", "")))
+                # B2: front/back それぞれ個別メッセージ
+                if not front:
+                    stats["errors"].append(f"Card {i}: listening front is empty")
+                if not back:
+                    stats["errors"].append(f"Card {i}: listening back is empty")
                 if not front or not back:
-                    stats["errors"].append(f"Card {i}: front or back is empty")
                     continue
                 if (_field_too_long("front", front, i)
                         or _field_too_long("back", back, i)
@@ -517,18 +578,14 @@ def generate_anki_deck(
                     word = _sanitize_word(str(card.get("word", "")))
                     if _field_too_long("word", word, i):
                         continue
-                    model = TTS_MODELS.get(card_type, BASIC_TTS_MODEL)
-                    if card_type not in TTS_MODELS:
-                        card_type = "basic"
+                    model = TTS_MODELS[card_type]
                     note = NoteWithGuid(
                         model=model,
                         fields=[front, back, word],
                         tags=tags,
                     )
                 else:
-                    model = MODELS.get(card_type, BASIC_MODEL)
-                    if card_type not in MODELS:
-                        card_type = "basic"
+                    model = MODELS[card_type]
                     note = NoteWithGuid(
                         model=model,
                         fields=[front, back],
@@ -536,10 +593,16 @@ def generate_anki_deck(
                     )
 
             deck.add_note(note)
-            stats[card_type] += 1
+            # B3: stats キーが存在しない card_type はデフォルト "basic" にフォールバック
+            stats_key = card_type if card_type in stats else "basic"
+            stats[stats_key] += 1
 
-        except Exception as e:
+        except (KeyError, ValueError, TypeError) as e:
             stats["errors"].append(f"Card {i}: {e}")
+        except Exception as e:
+            # 予期しない例外はログして再 raise（MemoryError 等を握り潰さない）
+            stats["errors"].append(f"Card {i}: unexpected error: {e}")
+            raise
 
     total = stats["basic"] + stats["reversed"] + stats["cloze"] + stats["typing"] + stats["listening"]
     if total == 0:
@@ -551,7 +614,7 @@ def generate_anki_deck(
     package = genanki.Package(deck)
     package.write_to_file(str(resolved_path))
 
-    result = f"デッキ生成完了!\n"
+    result = "デッキ生成完了!\n"
     result += f"ファイル: {resolved_path}\n"
     result += f"合計 {total} 枚"
     if tts:
@@ -562,8 +625,12 @@ def generate_anki_deck(
             result += f"  - {t.capitalize()}: {stats[t]}枚\n"
     if stats["errors"]:
         result += f"エラー {len(stats['errors'])}件:\n"
-        for err in stats["errors"][:5]:
-            result += f"  - {err}\n"
+        # B3: 5件超は件数を追記して表示
+        errs = stats["errors"][:5]
+        extra = len(stats["errors"]) - 5
+        if extra > 0:
+            errs.append(f"... and {extra} more")
+        result += "\n".join(f"  • {e}" for e in errs) + "\n"
 
     return result
 
@@ -709,19 +776,32 @@ def generate_cloze_from_text(
         生成結果
     """
     cards = []
-    for s in sentences:
+    skipped = 0
+    for idx, s in enumerate(sentences):
+        # B11: text が空のエントリをスキップ（空カードを append して error ログに乗せる必要はない）
+        if not isinstance(s, dict):
+            skipped += 1
+            continue
+        text = s.get("text", "")
+        if not text:
+            skipped += 1
+            continue
+        # B6: ここで _normalize_tags を呼ばず、generate_anki_deck 側に正規化を一任する
         cards.append({
             "type": "cloze",
-            "text": s.get("text", ""),
+            "text": text,
             "extra": s.get("extra", ""),
-            "tags": s.get("tags", []),
+            "tags": s.get("tags"),
         })
 
-    return generate_anki_deck(
+    result = generate_anki_deck(
         deck_name=deck_name,
         cards=cards,
         output_path=output_path,
     )
+    if skipped:
+        result += f"スキップ {skipped}件 (非dict or text空)\n"
+    return result
 
 
 @mcp.tool()
@@ -773,7 +853,8 @@ def generate_vocab_deck(
         example = html.escape(w.get("example", ""))
         pos = html.escape(w.get("pos", ""))
         etymology = html.escape(w.get("etymology", ""))
-        tags = w.get("tags", [])
+        # B6: ここで _normalize_tags を呼ばず、generate_anki_deck 側に正規化を一任する
+        tags = w.get("tags")
 
         if not word or not meaning:
             continue
@@ -782,6 +863,7 @@ def generate_vocab_deck(
         if pos:
             front += f"<br><span style='color:#666; font-size:14px;'>{pos}</span>"
 
+        # B5: back 全体を組み立ててから一度だけ _sanitize_html を適用
         back = meaning
         if etymology:
             back += f"<br><br><i>語源: {etymology}</i>"
