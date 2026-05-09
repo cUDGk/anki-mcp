@@ -1,20 +1,172 @@
 """
 Anki Deck Generator MCP Server
 任意のデータからAnkiデッキ(.apkg)を生成するMCPサーバー
+
+出力先の制限:
+  デフォルト出力ディレクトリは ~/Desktop。
+  環境変数 ANKI_OUTPUT_DIR を設定するとそのディレクトリに変更できる。
+  output_path を明示する場合も ANKI_OUTPUT_DIR 配下に限定される。
+
+環境変数:
+  ANKI_OUTPUT_DIR  許可する出力ルートディレクトリ (省略時: ~/Desktop)
+  ANKI_CARD_LIMIT  1デッキに含めるカードの上限枚数 (省略時: 5000)
 """
 
-import json
 import os
-import random
+import re
+import html
 import hashlib
-from datetime import datetime
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
 import genanki
 
+try:
+    import bleach
+    _BLEACH_AVAILABLE = True
+except ImportError:
+    _BLEACH_AVAILABLE = False
+
+# S1: CSS sanitizer to prevent CSS-based external resource loading via style attribute.
+# Older bleach versions don't have css_sanitizer; fall back gracefully.
+try:
+    from bleach.css_sanitizer import CSSSanitizer
+    _CSS_SANITIZER = CSSSanitizer(
+        allowed_css_properties=[
+            "color", "background-color", "font-size", "font-weight",
+            "font-style", "font-family", "text-align", "text-decoration",
+            "border", "border-color", "border-width", "border-style",
+            "padding", "margin", "padding-left", "padding-right", "padding-top", "padding-bottom",
+            "margin-left", "margin-right", "margin-top", "margin-bottom",
+            "width", "height", "max-width", "max-height", "display",
+        ]
+    )
+except ImportError:
+    _CSS_SANITIZER = None
+
 mcp = FastMCP("anki-deck-generator")
+
+# ── 定数 ────────────────────────────────────────────────
+
+_DEFAULT_OUTPUT_DIR = Path.home() / "Desktop"
+_ANKI_OUTPUT_DIR = Path(os.environ.get("ANKI_OUTPUT_DIR", str(_DEFAULT_OUTPUT_DIR))).expanduser().resolve()
+_ANKI_CARD_LIMIT = int(os.environ.get("ANKI_CARD_LIMIT", "5000"))
+
+# bleach の許可タグ・属性
+_BLEACH_ALLOWED_TAGS = [
+    "b", "i", "u", "br", "span", "table", "tr", "td", "th",
+    "ul", "li", "ol", "code", "pre", "img",
+]
+
+
+def _allow_href(tag, name, value):
+    # S1: javascript:/data:/vbscript: URI を href に通さない
+    if name == "href" and re.match(r'^(javascript|data|vbscript):', value, re.I):
+        return None
+    return value
+
+
+def _allow_img_src(tag, name, value):
+    # S2: javascript: と data:非画像 を img src に通さない
+    if name == "src" and re.match(r'^(javascript:|data:(?!image/))', value, re.I):
+        return None
+    return value
+
+
+_BLEACH_ALLOWED_ATTRS = {
+    "*": ["style", "class"],
+    "img": _allow_img_src,
+    "a": _allow_href,
+}
+
+# S5: 1 フィールドあたりのバイト/文字長制限（オーバーすると skip+error 記録）
+_ANKI_FIELD_MAX = int(os.environ.get("ANKI_FIELD_MAX", str(64 * 1024)))
+
+
+def _sanitize_html(text: str) -> str:
+    """
+    カードフィールドのHTMLをサニタイズする。
+    bleach が利用可能であれば許可リストで洗浄する。
+    注: Anki はカードテンプレートを HTML として描画するため、
+        許可タグ内の XSS は依然としてリスクがある点に留意。
+    S2: strip=True で危険タグの中身も丸ごと除去する（エスケープ表示で残さない）。
+    S1: CSS sanitizer で style 属性経由の外部リソース読み込みを抑止する。
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    if _BLEACH_AVAILABLE:
+        kwargs = {
+            "tags": _BLEACH_ALLOWED_TAGS,
+            "attributes": _BLEACH_ALLOWED_ATTRS,
+            "strip": True,
+        }
+        if _CSS_SANITIZER is not None:
+            kwargs["css_sanitizer"] = _CSS_SANITIZER
+        return bleach.clean(text, **kwargs)
+    return text
+
+
+def _strip_html(text: str) -> str:
+    """HTMLタグを除去してplain textにする"""
+    if _BLEACH_AVAILABLE:
+        return bleach.clean(text, tags=[], strip=True)
+    return re.sub(r'<[^>]+>', '', text).strip()
+
+
+def _sanitize_word(word: str) -> str:
+    """
+    S4: TTS 用 word フィールドから HTML タグと Anki テンプレート metachar ({, }) を除く。
+    word は plain text として TTS エンジンに渡るので、HTML/テンプレート構文を含めると壊れる。
+    """
+    if not isinstance(word, str):
+        word = str(word)
+    # まず HTML を平文化
+    plain = _strip_html(word)
+    # Anki テンプレートの中括弧を除去（{{ や }} がフィールド値に混ざるとテンプレが破綻）
+    return plain.replace("{", "").replace("}", "").strip()
+
+
+# ── パス検証ヘルパー ────────────────────────────────────
+
+def _validate_output_path(output_path: str, deck_name: str) -> Path:
+    """
+    output_path を検証し、ANKI_OUTPUT_DIR 配下に限定した絶対パスを返す。
+    output_path が空の場合はデフォルト (ANKI_OUTPUT_DIR/{safe_deck_name}.apkg) を使う。
+    パス・トラバーサルや不正パスは ValueError を送出する。
+    """
+    if not output_path:
+        # pathlib で safe なファイル名コンポーネントを取得してから違法文字を除去
+        raw_name = Path(deck_name).name  # ディレクトリコンポーネントを除去
+        # S5: 置換後が空文字になった場合は "deck" にフォールバック
+        safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', raw_name) or "deck"
+        resolved = (_ANKI_OUTPUT_DIR / f"{safe_name}.apkg").resolve()
+    else:
+        resolved = Path(output_path).expanduser().resolve()
+
+    # S1: ANKI_OUTPUT_DIR 配下であることを強制（シンボリックリンク先も追う）
+    try:
+        resolved.relative_to(_ANKI_OUTPUT_DIR)
+    except ValueError:
+        raise ValueError(
+            f"output_path は {_ANKI_OUTPUT_DIR} 配下でなければなりません: {resolved}"
+        )
+
+    # S3: シンボリックリンクを辿った実体パスで再検証
+    real = resolved.resolve()
+    try:
+        real.relative_to(_ANKI_OUTPUT_DIR)
+    except ValueError:
+        raise ValueError(
+            f"output_path resolves outside ANKI_OUTPUT_DIR: {real}"
+        )
+
+    # S5: ディレクトリ作成はパス検証の後
+    parent = resolved.parent
+    os.makedirs(parent, exist_ok=True)
+
+    return resolved
+
 
 # ── モデル定義 ──────────────────────────────────────────
 
@@ -283,15 +435,22 @@ def generate_anki_deck(
     if not cards:
         return "エラー: カードが空です"
 
-    import re
-
-    def strip_html(text: str) -> str:
-        """HTMLタグを除去してplain textにする"""
-        return re.sub(r'<[^>]+>', '', text).strip()
-
     deck = genanki.Deck(_deck_id(deck_name), deck_name, description=description)
 
     stats = {"basic": 0, "reversed": 0, "cloze": 0, "typing": 0, "listening": 0, "errors": []}
+
+    def _field_too_long(label: str, value: str, idx: int) -> bool:
+        """S5: 1 フィールドが上限を超えたらエラーとして記録し True を返す"""
+        if len(value) > _ANKI_FIELD_MAX:
+            stats["errors"].append(
+                f"Card {idx}: {label} が {len(value)} 文字で上限 {_ANKI_FIELD_MAX} を超過"
+            )
+            return True
+        return False
+
+    # S8: カード数上限チェック
+    if len(cards) > _ANKI_CARD_LIMIT:
+        return f"エラー: カード数 {len(cards)} が上限 {_ANKI_CARD_LIMIT} を超えています"
 
     for i, card in enumerate(cards):
         try:
@@ -299,13 +458,21 @@ def generate_anki_deck(
             tags = card.get("tags", [])
 
             if card_type == "cloze":
-                text = card.get("text", "")
-                extra = card.get("extra", "")
+                text = _sanitize_html(card.get("text", ""))
+                extra = _sanitize_html(card.get("extra", ""))
                 if not text:
                     stats["errors"].append(f"Card {i}: cloze text is empty")
                     continue
+                if _field_too_long("cloze text", text, i) or _field_too_long("cloze extra", extra, i):
+                    continue
                 if tts:
-                    word = card.get("word", strip_html(re.sub(r'\{\{c\d+::(.*?)\}\}', r'\1', text)))
+                    # S4: word は plain text 化 + Anki metachar 除去
+                    raw_word = card.get("word", "")
+                    word = _sanitize_word(str(raw_word))
+                    if not word:
+                        word = _sanitize_word(re.sub(r'\{\{c\d+::(.*?)\}\}', r'\1', str(card.get("text", ""))))
+                    if _field_too_long("word", word, i):
+                        continue
                     note = NoteWithGuid(
                         model=TTS_MODELS["cloze"],
                         fields=[text, extra, word],
@@ -321,11 +488,15 @@ def generate_anki_deck(
                 if not tts:
                     stats["errors"].append(f"Card {i}: listening type requires tts=True")
                     continue
-                front = card.get("front", "")
-                back = card.get("back", "")
-                word = card.get("word", strip_html(front))
+                front = _sanitize_html(card.get("front", ""))
+                back = _sanitize_html(card.get("back", ""))
+                word = _sanitize_word(str(card.get("word", "")))
                 if not front or not back:
                     stats["errors"].append(f"Card {i}: front or back is empty")
+                    continue
+                if (_field_too_long("front", front, i)
+                        or _field_too_long("back", back, i)
+                        or _field_too_long("word", word, i)):
                     continue
                 note = NoteWithGuid(
                     model=LISTENING_MODEL,
@@ -333,14 +504,19 @@ def generate_anki_deck(
                     tags=tags,
                 )
             else:
-                front = card.get("front", "")
-                back = card.get("back", "")
+                front = _sanitize_html(card.get("front", ""))
+                back = _sanitize_html(card.get("back", ""))
                 if not front or not back:
                     stats["errors"].append(f"Card {i}: front or back is empty")
                     continue
+                if _field_too_long("front", front, i) or _field_too_long("back", back, i):
+                    continue
 
                 if tts:
-                    word = card.get("word", strip_html(front))
+                    # S4: word は plain text 化 + Anki metachar 除去
+                    word = _sanitize_word(str(card.get("word", "")))
+                    if _field_too_long("word", word, i):
+                        continue
                     model = TTS_MODELS.get(card_type, BASIC_TTS_MODEL)
                     if card_type not in TTS_MODELS:
                         card_type = "basic"
@@ -369,21 +545,14 @@ def generate_anki_deck(
     if total == 0:
         return f"エラー: 有効なカードが0枚です。エラー: {stats['errors']}"
 
-    # 出力先
-    if not output_path:
-        safe_name = deck_name.replace("::", "_").replace("/", "_").replace("\\", "_")
-        output_path = os.path.join(
-            os.path.expanduser("~/Desktop"), f"{safe_name}.apkg"
-        )
-
-    output_path = os.path.abspath(output_path)
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    # S1/S2/S5: パス検証（makedirs もここで実行）
+    resolved_path = _validate_output_path(output_path, deck_name)
 
     package = genanki.Package(deck)
-    package.write_to_file(output_path)
+    package.write_to_file(str(resolved_path))
 
     result = f"デッキ生成完了!\n"
-    result += f"ファイル: {output_path}\n"
+    result += f"ファイル: {resolved_path}\n"
     result += f"合計 {total} 枚"
     if tts:
         result += " (TTS音声付き)"
@@ -406,40 +575,56 @@ def merge_anki_decks(
     merged_deck_name: str = "Merged Deck",
 ) -> str:
     """
-    複数の.apkgファイルを1つにマージする。
+    複数の.apkgファイルを1つにマージする手順を案内する。
+
+    注意: このツールは実際にファイルをマージするのではなく、
+    Anki アプリ上で手動マージを行うための手順を返す。
 
     Args:
         input_paths: マージ元の.apkgファイルパスの配列
-        output_path: 出力先パス (省略時: ~/Desktop/merged.apkg)
-        merged_deck_name: マージ後のデッキ名
+        output_path: (任意) エクスポート先の目安として案内文に表示される。実ファイル操作は行わない
+        merged_deck_name: マージ後のデッキ名 (案内文に表示)
 
     Returns:
-        マージ結果
+        Ankiでのマージ手順
     """
-    import zipfile
-    import sqlite3
-    import tempfile
-
     if len(input_paths) < 2:
         return "エラー: 2つ以上のファイルを指定してください"
 
-    all_decks = []
+    # S6: input_paths は ANKI_OUTPUT_DIR 配下 + .apkg 拡張子のみ受け付ける
+    invalid: list[str] = []
+    resolved_paths: list[Path] = []
     for path in input_paths:
-        path = os.path.abspath(os.path.expanduser(path))
-        if not os.path.exists(path):
-            return f"エラー: ファイルが見つかりません: {path}"
+        resolved = Path(path).expanduser().resolve()
+        if resolved.suffix.lower() != ".apkg":
+            invalid.append(f"{resolved} (拡張子が .apkg ではありません)")
+            continue
+        try:
+            resolved.relative_to(_ANKI_OUTPUT_DIR)
+        except ValueError:
+            invalid.append(f"{resolved} ({_ANKI_OUTPUT_DIR} 配下ではありません)")
+            continue
+        resolved_paths.append(resolved)
+    if invalid:
+        invalid_list = "\n".join(f"  - {p}" for p in invalid)
+        return f"エラー: 以下のパスは受け付けられません:\n{invalid_list}"
 
-    # genankiでは直接マージできないので、そのまま情報を返す
-    if not output_path:
-        output_path = os.path.join(
-            os.path.expanduser("~/Desktop"), "merged.apkg"
-        )
+    # S11: 全ファイルの存在を確認し、欠落を全部まとめて報告
+    missing = [str(p) for p in resolved_paths if not p.exists()]
+    if missing:
+        missing_list = "\n".join(f"  - {p}" for p in missing)
+        return f"エラー: 以下のファイルが見つかりません:\n{missing_list}"
 
-    result = "ℹ️ Ankiでのマージ手順:\n"
+    # S4: ユーザー提供値を html.escape してインジェクションを防ぐ
+    safe_deck_name = html.escape(merged_deck_name)
+    safe_output = html.escape(output_path.strip()) if output_path else ""
+    target_label = safe_output if safe_output else f"(任意) {safe_deck_name}.apkg"
+    result = f"ℹ️ Ankiでのマージ手順 (マージ後のデッキ名: {safe_deck_name}):\n"
     result += "Ankiを開いて以下のファイルを順にインポートしてください:\n"
-    for p in input_paths:
-        result += f"  - {os.path.abspath(os.path.expanduser(p))}\n"
-    result += "\nAnki側で同じデッキ名にすれば自動的にマージされます。"
+    for p in resolved_paths:
+        result += f"  - {p}\n"
+    result += f"\nAnki側でデッキ名を「{safe_deck_name}」に統一すると自動的にマージされます。"
+    result += f"\nエクスポート先の目安: {target_label}"
 
     return result
 
@@ -584,15 +769,16 @@ def generate_vocab_deck(
     for w in words:
         word = w.get("word", "")
         meaning = w.get("meaning", "")
-        example = w.get("example", "")
-        pos = w.get("pos", "")
-        etymology = w.get("etymology", "")
+        # S9: pos/etymology/example は HTML エスケープしてから挿入
+        example = html.escape(w.get("example", ""))
+        pos = html.escape(w.get("pos", ""))
+        etymology = html.escape(w.get("etymology", ""))
         tags = w.get("tags", [])
 
         if not word or not meaning:
             continue
 
-        front = f"<b>{word}</b>"
+        front = f"<b>{html.escape(word)}</b>"
         if pos:
             front += f"<br><span style='color:#666; font-size:14px;'>{pos}</span>"
 
@@ -601,6 +787,7 @@ def generate_vocab_deck(
             back += f"<br><br><i>語源: {etymology}</i>"
         if example:
             back += f"<br><br><i>例: {example}</i>"
+        back = _sanitize_html(back)
 
         card = {
             "type": card_type,
@@ -609,7 +796,8 @@ def generate_vocab_deck(
             "tags": tags,
         }
         if tts:
-            card["word"] = word  # plain text for TTS
+            # S4: TTS 用 word は plain text 化 + Anki metachar 除去
+            card["word"] = _sanitize_word(word)
 
         cards.append(card)
 
