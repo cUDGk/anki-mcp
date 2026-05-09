@@ -17,6 +17,7 @@ import re
 import html
 import hashlib
 from pathlib import Path
+from typing import Literal, TypedDict
 
 from mcp.server.fastmcp import FastMCP
 
@@ -134,66 +135,6 @@ def _normalize_tags(raw: object) -> list[str]:
             return []
     # B4: str(t).strip() の真偽で空白のみを除外し、空白除去後の値を使う
     return [s.replace(" ", "_") for t in raw if t is not None for s in [str(t).strip()] if s]
-
-
-def _sanitize_word(word: str) -> str:
-    """
-    S4: TTS 用 word フィールドから HTML タグと Anki テンプレート metachar ({, }) を除く。
-    word は plain text として TTS エンジンに渡るので、HTML/テンプレート構文を含めると壊れる。
-    """
-    if not isinstance(word, str):
-        word = str(word)
-    # まず HTML を平文化
-    plain = _strip_html(word)
-    # Anki テンプレートの中括弧を除去（{{ や }} がフィールド値に混ざるとテンプレが破綻）
-    return plain.replace("{", "").replace("}", "").strip()
-
-
-# ── パス検証ヘルパー ────────────────────────────────────
-
-def _validate_output_path(output_path: str, deck_name: str) -> Path:
-    """
-    output_path を検証し、ANKI_OUTPUT_DIR 配下に限定した絶対パスを返す。
-    output_path が空の場合はデフォルト (ANKI_OUTPUT_DIR/{safe_deck_name}.apkg) を使う。
-    パス・トラバーサルや不正パスは ValueError を送出する。
-    """
-    if not output_path:
-        # pathlib で safe なファイル名コンポーネントを取得してから違法文字を除去
-        raw_name = Path(deck_name).name  # ディレクトリコンポーネントを除去
-        # S5: 置換後が空文字になった場合は "deck" にフォールバック
-        safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', raw_name) or "deck"
-        resolved = (_ANKI_OUTPUT_DIR / f"{safe_name}.apkg").resolve()
-    else:
-        resolved = Path(output_path).expanduser().resolve()
-
-    # S1: ANKI_OUTPUT_DIR 配下であることを強制（シンボリックリンク先も追う）
-    try:
-        resolved.relative_to(_ANKI_OUTPUT_DIR)
-    except ValueError:
-        raise ValueError(
-            f"output_path は {_ANKI_OUTPUT_DIR} 配下でなければなりません: {resolved}"
-        )
-
-    # S3: シンボリックリンクを辿った実体パスで再検証
-    real = resolved.resolve()
-    try:
-        real.relative_to(_ANKI_OUTPUT_DIR)
-    except ValueError:
-        raise ValueError(
-            f"output_path resolves outside ANKI_OUTPUT_DIR: {real}"
-        )
-
-    # S5: ディレクトリ作成はパス検証の後
-    parent = resolved.parent
-    os.makedirs(parent, exist_ok=True)
-
-    return resolved
-
-
-def _strip_cloze(text: str) -> str:
-    """C2: cloze 構文 {{c1::content}} / {{c1::content::hint}} を content 部分に置換
-    [^:}] でパイプ区切りヒント ("content|hint") も content として保持する"""
-    return re.sub(r'\{\{c\d+::([^:}]+)(?:::[^}]*)?\}\}', r'\1', text)
 
 
 # ── モデル定義 ──────────────────────────────────────────
@@ -417,12 +358,86 @@ class NoteWithGuid(genanki.Note):
         return genanki.guid_for(key)
 
 
+def _strip_cloze(text: str) -> str:
+    """C2: cloze 構文 {{c1::content}} / {{c1::content::hint}} を content 部分に置換
+    [^:}] でパイプ区切りヒント ("content|hint") も content として保持する"""
+    return re.sub(r'\{\{c\d+::([^:}]+)(?:::[^}]*)?\}\}', r'\1', text)
+
+
+def _sanitize_word(word: str) -> str:
+    """
+    S4: TTS 用 word フィールドから HTML タグと Anki テンプレート metachar ({, }) を除く。
+    word は plain text として TTS エンジンに渡るので、HTML/テンプレート構文を含めると壊れる。
+    """
+    if not isinstance(word, str):
+        word = str(word)
+    # まず HTML を平文化
+    plain = _strip_html(word)
+    # Anki テンプレートの中括弧を除去（{{ や }} がフィールド値に混ざるとテンプレが破綻）
+    return plain.replace("{", "").replace("}", "").strip()
+
+
+# ── TypedDict ──────────────────────────────────────────
+
+class CardInput(TypedDict, total=False):
+    """generate_anki_deck に渡す cards 要素のスキーマ"""
+    # U1: Literal で有効値を列挙（"listening" を追加）
+    type: Literal["basic", "reversed", "cloze", "typing", "listening"]
+    front: str
+    back: str
+    text: str        # cloze 用
+    extra: str       # cloze 用
+    word: str        # TTS 用 plain text
+    tags: list
+
+
+# ── パス検証ヘルパー ────────────────────────────────────
+
+def _validate_output_path(output_path: str, deck_name: str) -> Path:
+    """
+    output_path を検証し、ANKI_OUTPUT_DIR 配下に限定した絶対パスを返す。
+    output_path が空の場合はデフォルト (ANKI_OUTPUT_DIR/{safe_deck_name}.apkg) を使う。
+    パス・トラバーサルや不正パスは ValueError を送出する。
+    """
+    if not output_path:
+        # pathlib で safe なファイル名コンポーネントを取得してから違法文字を除去
+        raw_name = Path(deck_name).name  # ディレクトリコンポーネントを除去
+        # S5: 置換後が空文字になった場合は "deck" にフォールバック
+        safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', raw_name) or "deck"
+        resolved = (_ANKI_OUTPUT_DIR / f"{safe_name}.apkg").resolve()
+    else:
+        resolved = Path(output_path).expanduser().resolve()
+
+    # S1: ANKI_OUTPUT_DIR 配下であることを強制（シンボリックリンク先も追う）
+    try:
+        resolved.relative_to(_ANKI_OUTPUT_DIR)
+    except ValueError:
+        raise ValueError(
+            f"output_path は {_ANKI_OUTPUT_DIR} 配下でなければなりません: {resolved}"
+        )
+
+    # S3: シンボリックリンクを辿った実体パスで再検証
+    real = resolved.resolve()
+    try:
+        real.relative_to(_ANKI_OUTPUT_DIR)
+    except ValueError:
+        raise ValueError(
+            f"output_path resolves outside ANKI_OUTPUT_DIR: {real}"
+        )
+
+    # S5: ディレクトリ作成はパス検証の後
+    parent = resolved.parent
+    os.makedirs(parent, exist_ok=True)
+
+    return resolved
+
+
 # ── MCP ツール ──────────────────────────────────────────
 
 @mcp.tool()
 def generate_anki_deck(
     deck_name: str,
-    cards: list[dict],
+    cards: list[CardInput],
     output_path: str = "",
     description: str = "",
     tts: bool = False,
@@ -432,6 +447,8 @@ def generate_anki_deck(
 
     どんな教科・分野でもOK。Claude が事前にデータを解析して
     適切な cards 配列を組み立ててからこのツールを呼ぶ。
+
+    出力先は ANKI_OUTPUT_DIR 配下（デフォルト: ~/Desktop）に限定される。
 
     Args:
         deck_name: デッキ名 (例: "英単語TOEIC", "高校物理::力学")
@@ -450,30 +467,43 @@ def generate_anki_deck(
 
             TTS対応時 (tts=True) の追加フィールド:
                 "word": TTS で読み上げる英単語/フレーズ (plain text、HTMLなし)
-                ※ word を省略すると front からHTMLタグを除去して自動生成
+                ※ word を省略すると "" (空文字) が使われ TTS は無音になる
 
             ※ front/back にはHTMLも使える (<b>, <i>, <br>, <img>, <table>等)
             ※ tags は省略可能
-        output_path: 出力先パス (省略時: ~/Desktop/{deck_name}.apkg)
-        description: デッキの説明文
-        tts: True にすると英語TTS音声付きカードを生成（iOS AnkiMobile対応）
-             カード表示時にiOSの音声エンジンで英単語を読み上げる
+        output_path: 出力先パス (省略時: ANKI_OUTPUT_DIR/<safe_deck_name>.apkg)
+                     ※ safe_deck_name は deck_name から OS 不正文字を `_` に置換したもの
+                     ANKI_OUTPUT_DIR 配下のパスのみ受け付ける
+        description: デッキの説明 (Anki のデッキ一覧に表示される)
+        tts: True にすると英語TTS音声付きカードを生成（PC版 Anki / iOS AnkiMobile 両対応）
+             カード表示時に Anki 内蔵 TTS エンジンで英単語を読み上げる
+             ※ {{tts ...}} 構文は Anki 2.1.20+ が必要
 
     Returns:
         生成されたファイルのパスと統計情報
     """
     # B4: 空チェックを上限チェックより先に行う
     if not cards:
-        return "エラー: カードが空です"
+        raise ValueError("カードが空です")
 
     # S8: カード数上限チェック
     if len(cards) > _ANKI_CARD_LIMIT:
-        return f"エラー: カード数 {len(cards)} が上限 {_ANKI_CARD_LIMIT} を超えています"
+        raise ValueError(
+            f"カード数 {len(cards)} が上限 {_ANKI_CARD_LIMIT} を超えています"
+        )
 
     # B3: deck_name は空白除去した値を以降全て使う（_deck_id, パス生成に影響）
     deck_name = deck_name.strip() if isinstance(deck_name, str) else ""
     if not deck_name:
-        return "エラー: deck_name を指定してください"
+        raise ValueError("deck_name を指定してください")
+
+    # U4: listening を含む & tts が無効 → カードループに入る前に早期エラー
+    if not tts:
+        for i, card in enumerate(cards):
+            if isinstance(card, dict) and card.get("type") == "listening":
+                raise ValueError(
+                    f"listening カード (index {i}) は tts=True が必要です"
+                )
 
     deck = genanki.Deck(_deck_id(deck_name), deck_name, description=description)
 
@@ -542,9 +572,7 @@ def generate_anki_deck(
                         tags=tags,
                     )
             elif card_type == "listening":
-                if not tts:
-                    stats["errors"].append(f"Card {i}: listening type requires tts=True")
-                    continue
+                # tts チェックは関数冒頭で早期 raise 済みなので到達時は tts=True 確定
                 front = _sanitize_html(card.get("front", ""))
                 back = _sanitize_html(card.get("back", ""))
                 word = _sanitize_word(str(card.get("word", "")))
@@ -606,7 +634,7 @@ def generate_anki_deck(
 
     total = stats["basic"] + stats["reversed"] + stats["cloze"] + stats["typing"] + stats["listening"]
     if total == 0:
-        return f"エラー: 有効なカードが0枚です。エラー: {stats['errors']}"
+        raise ValueError(f"有効なカードが0枚です。エラー: {stats['errors']}")
 
     # S1/S2/S5: パス検証（makedirs もここで実行）
     resolved_path = _validate_output_path(output_path, deck_name)
@@ -656,7 +684,7 @@ def merge_anki_decks(
         Ankiでのマージ手順
     """
     if len(input_paths) < 2:
-        return "エラー: 2つ以上のファイルを指定してください"
+        raise ValueError("2つ以上のファイルを指定してください")
 
     # S6: input_paths は ANKI_OUTPUT_DIR 配下 + .apkg 拡張子のみ受け付ける
     invalid: list[str] = []
@@ -674,13 +702,13 @@ def merge_anki_decks(
         resolved_paths.append(resolved)
     if invalid:
         invalid_list = "\n".join(f"  - {p}" for p in invalid)
-        return f"エラー: 以下のパスは受け付けられません:\n{invalid_list}"
+        raise ValueError(f"以下のパスは受け付けられません:\n{invalid_list}")
 
     # S11: 全ファイルの存在を確認し、欠落を全部まとめて報告
     missing = [str(p) for p in resolved_paths if not p.exists()]
     if missing:
         missing_list = "\n".join(f"  - {p}" for p in missing)
-        return f"エラー: 以下のファイルが見つかりません:\n{missing_list}"
+        raise ValueError(f"以下のファイルが見つかりません:\n{missing_list}")
 
     # S4: ユーザー提供値を html.escape してインジェクションを防ぐ
     safe_deck_name = html.escape(merged_deck_name)
@@ -737,7 +765,7 @@ def list_card_types() -> str:
 ## TTS音声オプション (tts=True)
 英語学習カードにiOS TTS音声を付与。全カードタイプで使用可能。
 - "word" フィールドにTTSで読み上げるplain textを指定
-- 省略するとfrontからHTMLを除去して自動生成
+- 省略すると "" (空文字) が使われ TTS は無音になる
 - iOSのAnkiMobileで自動再生される（PC版Ankiでも対応）
 ```json
 {"type": "reversed", "front": "<b>ephemeral</b>", "back": "はかない", "word": "ephemeral"}
@@ -755,6 +783,8 @@ def generate_cloze_from_text(
     deck_name: str,
     sentences: list[dict],
     output_path: str = "",
+    tts: bool = False,
+    description: str = "",
 ) -> str:
     """
     穴埋め問題を一括生成する専用ツール。
@@ -770,12 +800,14 @@ def generate_cloze_from_text(
                     "tags": ["生物", "遺伝"]
                 }
             ]
-        output_path: 出力先 (省略時: ~/Desktop/{deck_name}.apkg)
+        output_path: 出力先 (省略時: ANKI_OUTPUT_DIR/<safe_deck_name>.apkg)
+        tts: True にすると英語TTS音声付きカードを生成
+        description: デッキの説明文 (generate_anki_deck に転送)
 
     Returns:
-        生成結果
+        生成結果（スキップされたエントリ数も併記）
     """
-    cards = []
+    cards: list[CardInput] = []
     skipped = 0
     for idx, s in enumerate(sentences):
         # B11: text が空のエントリをスキップ（空カードを append して error ログに乗せる必要はない）
@@ -798,7 +830,10 @@ def generate_cloze_from_text(
         deck_name=deck_name,
         cards=cards,
         output_path=output_path,
+        description=description,
+        tts=tts,
     )
+    # U10: スキップ件数を結果に追記
     if skipped:
         result += f"スキップ {skipped}件 (非dict or text空)\n"
     return result
@@ -809,8 +844,9 @@ def generate_vocab_deck(
     deck_name: str,
     words: list[dict],
     reversible: bool = True,
-    tts: bool = False,
     output_path: str = "",
+    tts: bool = False,
+    description: str = "",
 ) -> str:
     """
     語彙カードを一括生成する専用ツール。英単語・用語集に最適。
@@ -835,15 +871,16 @@ def generate_vocab_deck(
                 語の成り立ち。ラテン語・ギリシャ語の語根、接頭辞・接尾辞の分解等
             ※ example, pos, etymology は省略可（ただし pos と etymology は極力含めること）
         reversible: True なら英→日 と 日→英 の両方向カードを生成
-        tts: True にすると英語TTS音声付き（iOS AnkiMobile対応）
+        output_path: 出力先 (省略時: ANKI_OUTPUT_DIR/<safe_deck_name>.apkg)
+        tts: True にすると英語TTS音声付き（PC版 Anki / iOS AnkiMobile 両対応）
              英→日カードでは単語表示時に発音再生
              日→英カードでは回答表示時に発音再生
-        output_path: 出力先
+        description: デッキの説明文 (generate_anki_deck に転送)
 
     Returns:
         生成結果
     """
-    cards = []
+    cards: list[CardInput] = []
     card_type = "reversed" if reversible else "basic"
 
     for w in words:
@@ -871,7 +908,7 @@ def generate_vocab_deck(
             back += f"<br><br><i>例: {example}</i>"
         back = _sanitize_html(back)
 
-        card = {
+        card: CardInput = {
             "type": card_type,
             "front": front,
             "back": back,
@@ -887,6 +924,7 @@ def generate_vocab_deck(
         deck_name=deck_name,
         cards=cards,
         output_path=output_path,
+        description=description,
         tts=tts,
     )
 
